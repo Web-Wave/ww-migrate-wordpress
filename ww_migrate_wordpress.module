@@ -1,0 +1,338 @@
+<?php
+
+/**
+ * @file
+ * Contains ww_migrate_wordpress.module.
+ */
+use Drupal\Core\Routing\RouteMatchInterface;
+use \Drupal\node\Entity\Node;
+use \Drupal\taxonomy\Entity\Term;
+use \Drupal\file\Entity\File;
+use \Drupal\user\Entity\User;
+use \Drupal\Core\File\FileSystem;
+
+/**
+ * Set env to UTF-8
+ */
+setlocale(LC_ALL,'en_US.UTF-8');
+
+/**
+ * Implements hook_help().
+ */
+function ww_migrate_wordpress_help($route_name, RouteMatchInterface $route_match) {
+  switch($route_name) {
+    case 'help.page.ww_migrate_wordpress':
+      $output = '';
+      $output .= '<h3>'.t('About').'</h3>';
+      $output .= '<p>'.t('This module provide a solution to import data from Wordpress to Drupal 8.<br />When your import is completed, disable the WW Migrate Wordpress module into the Drupal 8 Backend.<br />Please have a look to the README file inside the module folder to understand how to use it.').'</p>';
+      return $output;
+    default:
+  }
+}
+
+/**
+* Call back function drush_ww_migrate_wordpress_import_wordpress()
+* The call back function name in the following format
+*   drush_{module_name}_{item_id_for_command}()
+*/
+function drush_ww_migrate_wordpress_import_wordpress() {
+  if(drush_confirm('Are you sure to launch a Wordpress import?')):
+    drush_print('Wordpress import started!');
+
+    if(drush_confirm('Did you have created and imported the Wordpress database?')):
+      $database = drush_prompt(dt('All right, can you tell me the Wordpress database name please?'));
+      $host = drush_prompt(dt('The sql host please?'));
+      $user = drush_prompt(dt('The sql user please?'));
+      $password = drush_prompt(dt('The sql password please?'));
+      $prefix = drush_prompt(dt('And the prefix of tables inside this database please?'));
+      drush_print(dt('I will check the connexion with the database "@database" and the prefix "@prefix"...', array('@database' =>  $database, '@prefix' => $prefix)));
+      ww_migrate_wordpress_check_database($database,$host,$user,$password,$prefix);
+    else:
+      drush_log('Please, create and import the Wordpress database before to start your import.', 'warning');
+      drush_user_abort();
+    endif;
+  else:
+    drush_print('Wordpress import cancelled.');
+    drush_user_abort();
+  endif;
+}
+
+/**
+* Function ww_migrate_wordpress_check_database()
+*/
+function ww_migrate_wordpress_check_database($database,$host,$user,$password,$prefix) {
+  try {
+    $wordpress = new PDO('mysql:host='.$host.';dbname='.$database, $user, $password);
+    $wordpress->exec("SET CHARACTER SET utf8");
+    drush_log('The connexion to the database is a success!', 'ok');
+
+    $stmt = $wordpress->prepare('SELECT option_value FROM '.$prefix.'options WHERE option_name = "siteurl";');
+    $test_prefix = $stmt->execute();
+    $stmt = NULL;
+    $wordpress = NULL;
+
+    if($test_prefix):
+      drush_log('The prefix given is matching with your Wordpress database.', 'ok');
+
+      $setups = array ('database' => $database,
+                      'host'     => $host,
+                      'user'     => $user,
+                      'password' => $password,
+                      'prefix'   => $prefix);
+
+      ww_migrate_wordpress_menu($setups);
+    else:
+      drush_log('The prefix given doesn\'t match with your Wordpress database.', 'error');
+      drush_user_abort();
+    endif;
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Wordpress database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_wordpress_menu()
+*/
+function ww_migrate_wordpress_menu($setups) {
+  $options = array(
+    'posts' => 'Posts',
+  );
+
+  $choice = drush_choice($options, dt('What do you want to import?'));
+
+  if($choice):
+    drush_print(dt('You have chosen to import @choice.', array('@choice' => $options[$choice])));
+
+    switch($choice) {
+      case 'posts':
+        ww_migrate_wordpress_prepare_posts($setups);
+    }
+  endif;
+}
+
+/**
+* Function ww_migrate_wordpress_prepare_posts()
+*/
+function ww_migrate_wordpress_prepare_posts($setups) {
+  try {
+    $number = drush_prompt(dt('Since how many months do you want to get posts?'));
+    drush_print(dt('Go it, I will prepare the sql request to fetch all articles since the @number latest months.', array('@number' =>  $number)));
+
+    $wordpress = new PDO('mysql:host='.$setups['host'].';dbname='.$setups['database'], $setups['user'], $setups['password']);
+    $wordpress->exec("SET CHARACTER SET utf8");
+
+    $stmt = $wordpress->prepare('SELECT DISTINCT
+                                  p.post_title,
+                                  p.post_date,
+                                  (SELECT guid FROM '.$setups["prefix"].'posts WHERE id = pm.meta_value)
+                                  AS featured_image,
+                                  p.post_content,
+                                  (SELECT GROUP_CONCAT('.$setups["prefix"].'terms.name separator ",")
+                                      FROM '.$setups["prefix"].'terms
+                                      INNER JOIN '.$setups["prefix"].'term_taxonomy on '.$setups["prefix"].'terms.term_id = '.$setups["prefix"].'term_taxonomy.term_id
+                                      INNER JOIN '.$setups["prefix"].'term_relationships wpr on wpr.term_taxonomy_id = '.$setups["prefix"].'term_taxonomy.term_taxonomy_id
+                                      WHERE taxonomy= "category"
+                                      AND p.ID = wpr.object_id)
+                                  AS "post_categories",
+                                  (SELECT GROUP_CONCAT('.$setups["prefix"].'terms.name separator ",")
+                                      FROM '.$setups["prefix"].'terms
+                                      INNER JOIN '.$setups["prefix"].'term_taxonomy on '.$setups["prefix"].'terms.term_id = '.$setups["prefix"].'term_taxonomy.term_id
+                                      INNER JOIN '.$setups["prefix"].'term_relationships wpr on wpr.term_taxonomy_id = '.$setups["prefix"].'term_taxonomy.term_taxonomy_id
+                                      WHERE taxonomy= "post_tag"
+                                      AND p.ID = wpr.object_id)
+                                  AS "post_tags"
+                                  FROM '.$setups["prefix"].'posts AS p, '.$setups["prefix"].'postmeta AS pm
+                                  WHERE p.post_type = "post"
+                                  AND p.post_status = "publish"
+                                  AND p.id = pm.post_id
+                                  AND pm.meta_key =  "_thumbnail_id"
+                                  AND p.post_date > DATE_SUB(now(), INTERVAL :number MONTH)
+                                  ORDER BY p.post_date
+                                  DESC;
+                              ');
+
+    $stmt->bindParam(':number', $number);
+    $stmt->execute();
+    $wp_posts = $stmt->fetchall();
+    $stmt = NULL;
+    $wordpress = NULL;
+
+    drush_log('Request to the Wordpress database finished.', 'success');
+    ww_migrate_wordpress_insert_posts($setups,$wp_posts);
+  } catch (PDOException $error) {
+    drush_log('The connexion to the Wordpress database failed.', 'error');
+    drush_user_abort();
+  }
+}
+
+/**
+* Function ww_migrate_wordpress_insert_posts()
+*/
+function ww_migrate_wordpress_insert_posts($setups,$wp_posts) {
+  $drupal_user = drush_prompt(dt('Which username do you want to use as an author?'));
+  drush_print(dt('I will check if the username "@drupal_user" exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)));
+  $user = user_load_by_name($drupal_user);
+
+  if($user):
+    drush_log(dt('The username "@drupal_user" exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)), 'success');
+    drush_print('Articles import is launched!');
+
+    foreach($wp_posts as $post) {
+      $title = ww_migrate_wordpress_clean_data($post['post_title']);
+      $create_date = date('U', strtotime($post['post_date']));
+      $path_file = pathinfo($post['featured_image']);
+      $data = file_get_contents($post['featured_image']);
+      $file = file_save_data($data, 'public://'.$path_file['basename'], FILE_EXISTS_REPLACE);
+      $summary = strip_tags($post['post_content']);
+
+      if(strlen($summary) > 500):
+        $summary = substr($summary, 0, 500);
+        $summary = substr($summary,0,strrpos($summary," "));
+        $end = "...";
+        $summary = $summary.$end;
+      endif;
+
+      $summary = ww_migrate_wordpress_clean_data($summary);
+      $dom = new domDocument;
+      $dom->loadHTML($post['post_content']);
+      $dom->preserveWhiteSpace = false;
+      $images = $dom->getElementsByTagName('img');
+
+      foreach($images as $img) {
+        $url_image = $img->getAttribute('src');
+        $data_image = file_get_contents($url_image);
+        $path_file_image = pathinfo($url_image);
+        $path_file_image['dirname'] = str_replace('http://your_url.com/', '', $path_file_image['dirname']);
+        $public_path = Drupal::service('file_system')->realpath(file_default_scheme() . "://");
+
+        if(!is_dir($public_path.'/'.$path_file_image['dirname'])):
+          Drupal::service('file_system')->mkdir('public://'.$path_file_image['dirname'], NULL, TRUE, NULL);
+        endif;
+
+        $file_image = file_save_data($data_image, 'public://'.$path_file_image['dirname'].'/'.$path_file_image['basename'], FILE_EXISTS_REPLACE);
+      }
+
+      $content = str_replace('src="http://your_url.com/', 'src="/sites/default/files/', $post['post_content']);
+      $content = preg_replace('/<a href=\"(.*?)\">(.*?)<\/a>/', "\\2", $content);
+      $content = ww_migrate_wordpress_clean_data($content);
+      $categories = explode(',', $post['post_categories']);
+      $tags = explode(',', $post['post_tags']);
+      $tags_tid = array();
+      $categories_tid = array();
+
+      foreach($categories as $category) {
+        $category = ww_migrate_wordpress_clean_data($category);
+
+        $category_check = Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadByProperties([
+          'name' => $category,
+          'vid' => 'categories'
+        ]);
+
+        if(empty($category_check)):
+          $term = Term::create([
+            'name' => $category,
+            'vid' => 'categories',
+            'langcode' => 'en',
+          ]);
+          $term->save();
+          array_push($categories_tid, (int)$term->id());
+        else:
+          array_push($categories_tid, (int)current($category_check)->id());
+        endif;
+      }
+
+      foreach($tags as $tag) {
+        $tag = ww_migrate_wordpress_clean_data($tag);
+
+        $tag_check = Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadByProperties([
+          'name' => $tag,
+          'vid' => 'tag'
+        ]);
+
+        if(empty($tag_check)):
+          $term = Term::create([
+            'name' => $tag,
+            'vid' => 'tag',
+            'langcode' => 'en',
+          ]);
+          $term->save();
+          $tid = $term->id();
+          array_push($tags_tid, (int)$tid);
+        else:
+          $tid = current($tag_check)->id();
+          array_push($tags_tid, (int)$tid);
+        endif;
+      }
+
+      $tags_tid = array_unique($tags_tid);
+      $tags_tid = array_values($tags_tid);
+      $categories_tid = array_unique($categories_tid);
+      $categories_tid = array_values($categories_tid);
+
+      $article_check = Drupal::entityTypeManager()->getStorage('node')->loadByProperties([
+        'title' => $title,
+        'type' => 'article'
+      ]);
+
+      if(empty($article_check)):
+        $node = Node::create([
+          'type'              => 'article',
+          'title'             => $title,
+          'body'              => [
+            'value'           => $content,
+            'summary'         => $summary,
+            'format'          => 'full_html',
+          ],
+          'field_image'       => [
+            'target_id'       => $file->id(),
+            'alt'             => $title,
+            'title'           => $title
+          ],
+          'field_tags'        => $tags_tid,
+          'field_categories'  => $categories_tid,
+          'langcode'          => 'en',
+          'status'            => 1,
+          'uid'               => $user->id(),
+          'created'           => $create_date
+        ]);
+
+        $node->save();
+        drush_log(dt('Article called "@post" is imported.', array('@post' => $post['post_title'])), 'success');
+      endif;
+    }
+
+    ww_migrate_wordpress_menu($setups);
+  else:
+    drush_log(dt('The username "@drupal_user" doesn\'t exist inside your Drupal 8 database.', array('@drupal_user' =>  $drupal_user)), 'error');
+    ww_migrate_wordpress_menu($setups);
+  endif;
+}
+
+/**
+* Function ww_migrate_wordpress_clean_data()
+*/
+function ww_migrate_wordpress_clean_data($data) {
+  $data = trim($data);
+  $data = ucfirst($data);
+  return $data;
+}
+
+/**
+* Function ww_migrate_wordpress_in_array()
+*/
+function ww_migrate_wordpress_in_array($term, $array) {
+  foreach ($array as $key => $items) {
+    foreach ($items as $item) {
+      if (is_array($item)):
+        return ww_migrate_wordpress_in_array($term, [$key => $item]);
+      endif;
+      $cleaned_term = trim(strtolower($term));
+      $cleaned_item = trim(strtolower($item));
+      if($cleaned_term == $cleaned_item):
+        return $key;
+      endif;
+    }
+  }
+  return null;
+}

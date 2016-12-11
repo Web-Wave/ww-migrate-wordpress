@@ -1,0 +1,5 @@
+name: WW migrate Wordpress
+type: module
+description: Migrate data from Wordpress.
+core: 8.x
+package: WW Modules
